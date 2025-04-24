@@ -1,128 +1,131 @@
-import sys
-import itertools
-
 import asyncio
+import traceback
+import random
 
-from data.config import logger
-from utils.create_files import create_files
-from db_api.database import initialize_db
-from utils.adjust_policy import set_windows_event_loop_policy
-from data.config import EVM_PKS, PROXIES, EMAIL_DATA, TWITTER_TOKENS, DISCORD_TOKENS, logger
-from utils.import_info import get_info
-from utils.user_menu import get_action, abstract_menu, bridge_menu, badges_menu, onchain_menu
-from db_api.start_import import ImportToDB
-from settings.settings import ASYNC_TASK_IN_SAME_TIME
-from tasks.main import get_start
-from migrate import migrate
-from utils.reset_count_progress import set_progress_to_zero
-from utils.encrypt_params import check_encrypt_param
+from data.config import logger, tasks_lock, completed_tasks, remaining_tasks
+from db_api.models import Accounts
+from db_api.database import get_accounts
+from settings.settings import SLEEP_BEETWEEN_ACTIONS, ACCOUNT_SHUFFLE
+from tqdm import tqdm
+from tasks.abstract import Abstract
+from tasks.relay_bridge import RelayBridge
 
 
-def main():
-    global remaining_tasks
-
-    while True:
-        set_progress_to_zero()
-
-        user_choice = get_action()
-
-        semaphore = asyncio.Semaphore(ASYNC_TASK_IN_SAME_TIME)
-
-        match user_choice:
-
-            case "Import data to db":
-
-                evm_pks = get_info(EVM_PKS)
-                proxies = get_info(PROXIES)
-                emails = get_info(EMAIL_DATA)
-                twitter_tokens = get_info(TWITTER_TOKENS)
-                discord_tokens = get_info(DISCORD_TOKENS)
-
-                logger.info(f'\n\n\n'
-                            f'Загружено в evm_pks.txt {len(evm_pks)} аккаунтов EVM \n'
-                            f'Загружено в proxies.txt {len(proxies)} прокси \n'
-                            f'Загружено в emails.txt {len(emails)} прокси \n'
-                            f'Загружено в twitter_tokens.txt {len(twitter_tokens)} прокси \n'
-                            f'Загружено в discord_tokens.txt {len(discord_tokens)} прокси \n'
-                )
-
-                cycled_proxies_list = itertools.cycle(proxies) if proxies else None
-
-                formatted_data: list = [{
-                        'evm_pk': evm_pk,
-                        'proxy': next(cycled_proxies_list) if cycled_proxies_list else None,
-                        'email': emails.pop(0) if emails else None,
-                        'twitter_token': twitter_tokens.pop(0) if twitter_tokens else None,
-                        'discord_token': discord_tokens.pop(0) if discord_tokens else None,
-                    } for evm_pk in evm_pks
-                ]
-
-                asyncio.run(ImportToDB.add_info_to_db(accounts_data=formatted_data))
-
-            case "Abstract":
-                abstract_choice = abstract_menu()
-                match abstract_choice:
-                    case "🏆 Badges":
-                        badges_choice = badges_menu()
-                        match badges_choice:
-                            case "Mix claim all eligible badges":
-                                asyncio.run(get_start(semaphore, "Mix claim all eligible badges"))
-
-                            case "Connect Discord":
-                                asyncio.run(get_start(semaphore, "Badge 1"))
-
-                            case "Connect Twitter / X":
-                                asyncio.run(get_start(semaphore, "Badge 2"))
-                                
-                            case "Fund Your Account":
-                                asyncio.run(get_start(semaphore, "Badge 3"))
-
-                            case "App Voter":
-                                asyncio.run(get_start(semaphore, "Badge 4"))
-                            
-                            case "The Trader":
-                                asyncio.run(get_start(semaphore, "Badge 5"))
-
-                            case "Parse Badges Stats":
-                                asyncio.run(get_start(semaphore, "Parse Badges Stats"))
-
-                    case "🔗 Onchain":
-                        onchain_choice = onchain_menu()
-                        match onchain_choice:
-                            case "Vote":
-                                asyncio.run(get_start(semaphore, "Vote"))
-
-                            case "Swap":
-                                asyncio.run(get_start(semaphore, "Swap"))
-
-
-                    case "🔹 Register Accounts":
-                        asyncio.run(get_start(semaphore, "🔹 Register Accounts"))
-
-                    case "🐦 Connect Twitter":
-                        asyncio.run(get_start(semaphore, "🐦 Connect Twitter"))
-
-                    case "👾 Connect Discord":
-                        asyncio.run(get_start(semaphore, "👾 Connect Discord"))
-
-                    case "🌉 Bridge":
-                        bridge_choice = bridge_menu()
-                        match bridge_choice:
-                            case "1) Relay":
-                                asyncio.run(get_start(semaphore, "1) Relay"))
-
-
-            case "Exit":
-                sys.exit(1)
-
-
-if __name__ == "__main__":
+async def get_start(semaphore, quest: str):
     #try:
-        check_encrypt_param()
-        asyncio.run(initialize_db())
-        create_files()
-        asyncio.run(migrate())
-        set_windows_event_loop_policy()
-        main()
-    # except (SystemExit, KeyboardInterrupt):
-    #     logger.info("Program closed")
+
+        accounts: list[Accounts] = await get_accounts(quest)
+
+        # ДЛЯ ОПРЕДЛЕННОГО АККА
+        # all_accounts: list[Accounts] = await get_accounts(quest)
+        # accounts = []
+        # for address in all_accounts:
+        #     if address.evm_address == "":
+        #         accounts.append(address)
+        #         break
+            
+        if len(accounts) != 0:
+            if ACCOUNT_SHUFFLE:
+                random.shuffle(accounts)
+            logger.info(f'Всего задач: {len(accounts)}')
+            tasks = []
+            if isinstance(quest, str):
+                for account_data in accounts:
+                    task = asyncio.create_task(start_limited_task(semaphore, accounts, account_data, quest=quest))
+                    tasks.append(task)
+            else:
+                account_number = 1
+                for account_data in accounts:
+                    task = asyncio.create_task(start_limited_task(semaphore, accounts, account_data, quest=account_number))
+                    tasks.append(task)
+                    account_number += 1
+
+            await asyncio.wait(tasks)
+        else:
+            msg = (f'Не удалось начать действие, причина: нет подходящих аккаунтов для выбранного действия.')
+            logger.warning(msg)
+    # except Exception as e:
+    #     pass
+
+async def start_limited_task(semaphore, accounts, account_data, quest):
+    #try:
+        async with semaphore:
+            status = await start_task(account_data, quest)
+            async with tasks_lock:
+                completed_tasks[0] += 1
+                remaining_tasks[0] = len(accounts) - completed_tasks[0]
+
+            logger.warning(f'Всего задач: {len(accounts)}. Осталось задач: {remaining_tasks[0]}')
+
+            if remaining_tasks[0] > 0 and status:
+                # Генерация случайного времени ожидания
+                sleep_time = random.randint(SLEEP_BEETWEEN_ACTIONS[0], SLEEP_BEETWEEN_ACTIONS[1])
+
+                logger.info(f"Ожидание {sleep_time} между действиями...")
+                
+                await asyncio.sleep(sleep_time)
+
+async def start_task(account_data, quest):
+
+    if quest in {"🔹 Register Accounts"}:
+        async with Abstract(data=account_data) as abstract:
+            return await abstract.start_account_register()
+    
+    elif quest in {"🐦 Connect Twitter"}:
+        async with Abstract(data=account_data) as abstract:
+            return await abstract.start_connect_twitter()
+        
+    elif quest in {"👾 Connect Discord"}:
+        async with Abstract(data=account_data) as abstract:
+            return await abstract.start_connect_discord()
+        
+    elif quest in {"1) Relay"}:
+        async with RelayBridge(data=account_data) as relay:
+            return await relay.start_task()
+
+    elif quest in {"Vote"}:
+        async with Abstract(data=account_data) as abstract:
+            return await abstract.start_vote()
+        
+    elif quest in {"Swap"}:
+        async with Abstract(data=account_data) as abstract:
+            return await abstract.start_swap()
+        
+    elif quest in {"Mix claim all eligible badges"}:
+        async with Abstract(data=account_data) as abstract:
+            return await abstract.start_mix_claim_eligible_badges()
+
+    elif quest in {"Parse Badges Stats"}:
+        async with Abstract(data=account_data) as abstract:
+            return await abstract.start_parse_badges_stats()
+        
+    elif "Badge" in quest:
+        badges_dict = {
+            'Badge 1': {
+                'id': 1,
+                'name': "Connect Discord",
+            },
+            'Badge 2': {
+                'id': 2,
+                'name': "Connect Twitter / X", 
+            },
+            'Badge 3': {
+                'id': 3,
+                'name': "Fund Your Account",
+            },
+            'Badge 4': {
+                'id': 4,
+                'name': "App Voter"
+            },
+            'Badge 5': {
+                'id': 5,
+                'name': "The Trader"
+            },
+        }
+
+        async with Abstract(data=account_data) as abstract:
+            return await abstract.start_claim_badge(
+                badge_id=badges_dict[quest]['id'],
+                name=badges_dict[quest]['name'],
+            )
+    
