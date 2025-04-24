@@ -3,11 +3,6 @@
 ## 🎥 Видеообзор настройки и работы
 [тык](https://youtu.be/F2Y86CyzYbI)
 
-## 📢 Контакты
-
-- Мой Telegram канал: [@cryptosaniksin](https://t.me/cryptosaniksin)
-- Чат: [@cryptosaniksin_chat](https://t.me/cryptosaniksin_chat)
-
 ## 📦 Модули
 
 - **Abstact Registration** 
